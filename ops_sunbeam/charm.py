@@ -29,18 +29,27 @@ defines the pebble layers, manages pushing configuration to the
 containers and managing the service running in the container.
 """
 
+import copy
 import ipaddress
+import json
 import logging
+import time
+from functools import (
+    wraps,
+)
 from typing import (
     List,
     Mapping,
 )
+
+import tenacity
 
 import charms.observability_libs.v0.kubernetes_service_patch as kube_svc_patch
 import ops.charm
 import ops.framework
 import ops.model
 import ops.pebble
+import ops.storage
 from lightkube import (
     Client,
 )
@@ -61,10 +70,55 @@ import ops_sunbeam.relation_handlers as sunbeam_rhandlers
 logger = logging.getLogger(__name__)
 
 
+class NotReadyException(Exception):
+    """Raised when something is not ready"""
+
+    pass
+
+
+class LocalStorage:
+    def __init__(self, storage):
+        self.storage = storage
+        try:
+            self.storage.run_once
+        except AttributeError:
+            self.storage.run_once = {}
+
+    def __contains__(self, key):
+        return key in self.storage.run_once.keys()
+
+    def add(self, key):
+        self.storage.run_once[key] = str(time.time())
+
+
+class PeerStorage:
+    def __init__(self, charm):
+        self.charm = charm
+        if self.charm.leader_get("run_once") is None:
+            self.charm.leader_set(run_once=json.dumps({}))
+
+    def get_labels(self):
+        return json.loads(self.charm.leader_get("run_once"))
+
+    def set_labels(self, key):
+        self.charm.leader_set(run_once=json.dumps(key))
+
+    def __contains__(self, key):
+        return key in self.get_labels().keys()
+
+    def add(self, key):
+        _labels = self.get_labels()
+        _labels[key] = str(time.time())
+        self.set_labels(_labels)
+
+
 class OSBaseOperatorCharm(ops.charm.CharmBase):
     """Base charms for OpenStack operators."""
 
     _state = ops.framework.StoredState()
+
+    DB_SYNC_LABEL = "db-sync"
+    BOOTSTRAPPED_LABELS = [DB_SYNC_LABEL]
 
     # Holds set of mandatory relations
     mandatory_relations = set()
@@ -72,11 +126,17 @@ class OSBaseOperatorCharm(ops.charm.CharmBase):
     def __init__(self, framework: ops.framework.Framework) -> None:
         """Run constructor."""
         super().__init__(framework)
-
+        if isinstance(self.framework._storage, ops.storage.JujuStorage):
+            raise ValueError(
+                (
+                    "use_juju_for_storage=True is deprecated and not supported "
+                    "by ops_sunbeam"
+                )
+            )
         self.status = compound_status.Status("workload", priority=100)
         self.status_pool = compound_status.StatusPool(self)
         self.status_pool.add(self.status)
-        self._state.set_default(bootstrapped=False)
+        self.relation_handlers = self.get_relation_handlers()
         self.bootstrap_status = compound_status.Status(
             "bootstrap", priority=90
         )
@@ -85,9 +145,110 @@ class OSBaseOperatorCharm(ops.charm.CharmBase):
             self.bootstrap_status.set(
                 MaintenanceStatus("Service not bootstrapped")
             )
-        self.relation_handlers = self.get_relation_handlers()
         self.pebble_handlers = self.get_pebble_handlers()
         self.framework.observe(self.on.config_changed, self._on_config_changed)
+        self.framework.observe(self.on.start, self._on_start)
+        self.run_once_per_app_store = PeerStorage(self)
+        self.run_once_per_unit_store = LocalStorage(self._state)
+
+    @property
+    def completed_app_jobs(self) -> None:
+        run_once = self.leader_get("run_once")
+        if run_once is None:
+            return {}
+        return json.loads(run_once)
+
+    def manage_run_once_jobs(self) -> None:
+        """Manage jobs which should only run once per unit.
+
+        The main puprpose is to see if all units have a more recent install
+        time than the last time the job was run. If they do then unmark the
+        job as done as it should be rerun.
+        """
+        if not self.supports_peer_relation or not self.unit.is_leader():
+            return
+        install_times = self.peers.interface.get_all_unit_values(
+            "install-time", include_local_unit=True
+        )
+        # Bootstrap when all units are newer than the last time
+        # the job ran.
+        install_time = sorted([float(t) for t in install_times])
+        new_job_times = copy.deepcopy(self.completed_app_jobs)
+        for label, time in self.completed_app_jobs.items():
+            if float(time) < install_time[0]:
+                del new_job_times[label]
+        self.leader_set({"run_once": json.dumps(new_job_times)})
+
+    def record_install_time(self) -> None:
+        """Notify peers of a new incarnation of this unit"""
+        install_time = str(time.time())
+        logging.warning(f"Recording install time {install_time}")
+        self.peers.set_unit_data({"install-time": install_time})
+        logging.warning(
+            self.peers.get_all_unit_values(
+                "install-time", include_local_unit=True
+            )
+        )
+
+    def _on_start(self, event: ops.framework.EventBase) -> None:
+        """Handle start hook event."""
+        # The start hooks are only fired on new install or
+        # upgrade (including change of workload container).
+        # Therefore the firing of the start hook is a clear indication
+        # of a new instantiation of the pod.
+        self.record_install_time()
+        self.manage_run_once_jobs()
+        # start hooks happen after config-changed so retrigger
+        # configure_charm as new `install-time` may allow for
+        # once-per-app code to be run.
+        self.configure_charm(event)
+
+    def peer_change(self, event: ops.framework.EventBase) -> None:
+        """Handle peer changed hook event."""
+        self.manage_run_once_jobs()
+        # The charm needs to catch the case where the last unit to be upgraded
+        # was not the leader and has sent a notification of a new install time
+        # down the peer relation. This unit maybe the leader and may need to
+        # react to all units being upgraded so rerun `configure_charm`.
+        self.configure_charm(event)
+
+    def run_once_per_app(label):
+        """
+        Decorator for hook to specify minimum supported release
+        """
+
+        def wrap(f):
+            @wraps(f)
+            def wrapped_f(self, *args):
+                if label in self.run_once_per_app_store:
+                    logging.warning(f"LY OPA Not running {label}")
+                else:
+                    logging.warning(f"LY OPA Running {label}")
+                    f(self, *args)
+                    self.run_once_per_app_store.add(label)
+
+            return wrapped_f
+
+        return wrap
+
+    def run_once_per_unit(label):
+        """
+        Decorator for hook to specify minimum supported release
+        """
+
+        def wrap(f):
+            @wraps(f)
+            def wrapped_f(self, *args):
+                if label in self.run_once_per_unit_store:
+                    logging.warning(f"LY OPU Not running {label}")
+                else:
+                    logging.warning(f"LY OPU Running {label}")
+                    f(self, *args)
+                    self.run_once_per_unit_store.add(label)
+
+            return wrapped_f
+
+        return wrap
 
     def can_add_handler(
         self,
@@ -138,7 +299,7 @@ class OSBaseOperatorCharm(ops.charm.CharmBase):
                 handlers.append(db)
         if self.can_add_handler("peers", handlers):
             self.peers = sunbeam_rhandlers.BasePeerHandler(
-                self, "peers", self.configure_charm, False
+                self, "peers", self.peer_change, False
             )
             handlers.append(self.peers)
         if self.can_add_handler("certificates", handlers):
@@ -234,18 +395,16 @@ class OSBaseOperatorCharm(ops.charm.CharmBase):
             if h.container_name in container_names
         ]
 
-    # flake8: noqa: C901
-    def configure_charm(self, event: ops.framework.EventBase) -> None:
-        """Catchall handler to configure charm services."""
+    def configure_unit(self, event: ops.framework.EventBase) -> None:
         if self.supports_peer_relation and not (
             self.unit.is_leader() or self.is_leader_ready()
         ):
             logging.debug("Leader not ready")
-            return
+            raise NotReadyException
 
         if not self.relation_handlers_ready():
             logging.debug("Aborting charm relations not ready")
-            return
+            raise NotReadyException
 
         for ph in self.pebble_handlers:
             if ph.pebble_ready:
@@ -256,32 +415,51 @@ class OSBaseOperatorCharm(ops.charm.CharmBase):
                     f"Not running init for {ph.service_name},"
                     " container not ready"
                 )
+                raise NotReadyException
 
         for ph in self.pebble_handlers:
             if not ph.service_ready:
                 logging.debug(
                     f"Aborting container {ph.service_name} service not ready"
                 )
-                return
+                raise NotReadyException
 
-        if not self.bootstrapped():
-            if not self._do_bootstrap():
-                self._state.bootstrapped = False
-                logging.warning(
-                    "Failed to bootstrap the service, event deferred"
-                )
-                # Defer the event to re-trigger the bootstrap process
-                event.defer()
-                return
-            if self.unit.is_leader() and self.supports_peer_relation:
-                self.set_leader_ready()
+    def configure_app_leader(self, event):
+        self.run_db_sync()
+        self.set_leader_ready()
 
+    def configure_app_non_leader(self, event):
+        if not self.bootstrapped:
+            raise NotReadyException
+
+    def configure_app(self, event):
+        if self.unit.is_leader() and self.supports_peer_relation:
+            self.configure_app_leader(event)
+        else:
+            self.configure_app_non_leader(event)
+
+    def add_pebble_health_checks(self):
         # Add healthchecks to the plan
         for ph in self.pebble_handlers:
             ph.add_healthchecks()
 
+    # flake8: noqa: C901
+    def configure_charm(self, event: ops.framework.EventBase) -> None:
+        """Catchall handler to configure charm services."""
+
+        try:
+            self.configure_unit(event)
+            self.configure_app(event)
+        except NotReadyException as e:
+            return
+
+        self.bootstrap_status.set(
+            ActiveStatus()
+        )
+        logger.info("LY adding health checks")
+        self.add_pebble_health_checks()
+        logger.info("Setting active status")
         self.status.set(ActiveStatus(""))
-        self._state.bootstrapped = True
 
     @property
     def supports_peer_relation(self) -> bool:
@@ -379,7 +557,11 @@ class OSBaseOperatorCharm(ops.charm.CharmBase):
 
     def bootstrapped(self) -> bool:
         """Determine whether the service has been bootstrapped."""
-        return self._state.bootstrapped
+        try:
+           completed_jobs = self.completed_app_jobs.keys()
+        except AttributeError:
+           completed_jobs = []
+        return set(self.BOOTSTRAPPED_LABELS) <= set(completed_jobs)
 
     def leader_set(self, settings: dict = None, **kwargs) -> None:
         """Juju set data in peer data bag."""
@@ -404,6 +586,23 @@ class OSBaseOperatorCharm(ops.charm.CharmBase):
         """Name of Containerto run db sync from."""
         return self.service_name
 
+    @tenacity.retry(stop=tenacity.stop_after_attempt(3),
+                    retry=tenacity.retry_if_exception_type(ops.pebble.ChangeError),
+                    after=tenacity.after_log(logger, logging.WARNING),
+                    wait=tenacity.wait_exponential(multiplier=1, min=10, max=300))
+    def _retry_db_sync(self, cmd):
+        container = self.unit.get_container(
+            self.db_sync_container_name
+        )
+        logging.debug("Running sync: \n%s", cmd)
+        process = container.exec(cmd, timeout=5 * 60)
+        out, warnings = process.wait_output()
+        if warnings:
+            for line in warnings.splitlines():
+                logger.warning("DB Sync Out: %s", line.strip())
+                logging.debug("Output from database sync: \n%s", out)
+
+    @run_once_per_app(DB_SYNC_LABEL)
     def run_db_sync(self) -> None:
         """Run DB sync to init DB.
 
@@ -415,38 +614,16 @@ class OSBaseOperatorCharm(ops.charm.CharmBase):
         try:
             if self.db_sync_cmds:
                 logger.info("Syncing database...")
-                container = self.unit.get_container(
-                    self.db_sync_container_name
-                )
                 for cmd in self.db_sync_cmds:
-                    logging.debug("Running sync: \n%s", cmd)
-                    process = container.exec(cmd, timeout=5 * 60)
-                    out, warnings = process.wait_output()
-                    if warnings:
-                        for line in warnings.splitlines():
-                            logger.warning("DB Sync Out: %s", line.strip())
-                    logging.debug("Output from database sync: \n%s", out)
+                    try:
+                        self._retry_db_sync(cmd)
+                    except tenacity.RetryError:
+                        logging.error("DB sync run failed")
+                        raise NotReadyException
         except AttributeError:
             logger.warning(
                 "Not DB sync ran. Charm does not specify self.db_sync_cmds"
             )
-
-    def _do_bootstrap(self) -> bool:
-        """Perform bootstrap.
-
-        :return: Return True if bootstrap is success
-        :rtype: bool
-        """
-        try:
-            self.run_db_sync()
-            self.bootstrap_status.set(ActiveStatus())
-            return True
-        except ops.pebble.ExecError as e:
-            logger.exception("Failed to bootstrap")
-            logger.error("Exited with code %d. Stderr:", e.exit_code)
-            for line in e.stderr.splitlines():
-                logger.error("    %s", line)
-            return False
 
 
 class OSBaseOperatorAPICharm(OSBaseOperatorCharm):

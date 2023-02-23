@@ -133,6 +133,10 @@ class OSBaseOperatorCharm(ops.charm.CharmBase):
                     "by ops_sunbeam"
                 )
             )
+        # unit_bootstrapped is stored in the local unit storage which is lost
+        # when the pod is replaced, so this will revert to False on charm
+        # upgrade or upgrade of the payload container.
+        self._state.set_default(unit_bootstrapped=False)
         self.status = compound_status.Status("workload", priority=100)
         self.status_pool = compound_status.StatusPool(self)
         self.status_pool.add(self.status)
@@ -423,6 +427,7 @@ class OSBaseOperatorCharm(ops.charm.CharmBase):
                     f"Aborting container {ph.service_name} service not ready"
                 )
                 raise NotReadyException
+        self._state.unit_bootstrapped = True
 
     def configure_app_leader(self, event):
         self.run_db_sync()
@@ -557,11 +562,7 @@ class OSBaseOperatorCharm(ops.charm.CharmBase):
 
     def bootstrapped(self) -> bool:
         """Determine whether the service has been bootstrapped."""
-        try:
-           completed_jobs = self.completed_app_jobs.keys()
-        except AttributeError:
-           completed_jobs = []
-        return set(self.BOOTSTRAPPED_LABELS) <= set(completed_jobs)
+        return self._state.unit_bootstrapped and self.is_leader_ready()
 
     def leader_set(self, settings: dict = None, **kwargs) -> None:
         """Juju set data in peer data bag."""

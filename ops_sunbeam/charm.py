@@ -76,6 +76,44 @@ class NotReadyException(Exception):
     pass
 
 
+def run_once_per_app(label):
+    """
+    Decorator for hook to specify minimum supported release
+    """
+
+    def wrap(f):
+        @wraps(f)
+        def wrapped_f(self, *args, **kwargs):
+            if label in self.run_once_per_app_store:
+                logging.warning(f"Not running {label}, it has run previously for this app version")
+            else:
+                logging.warning(f"Running {label}, it has not run on this app version before")
+                f(self, *args, **kwargs)
+                self.run_once_per_app_store.add(label)
+
+        return wrapped_f
+    return wrap
+
+def run_once_per_unit(label):
+    """
+    Decorator for hook to specify minimum supported release
+    """
+
+    def wrap(f):
+        @wraps(f)
+        def wrapped_f(self, *args, **kwargs):
+            if label in self.run_once_per_unit_store:
+                logging.warning(f"Not running {label}, it has run previously for this unit")
+            else:
+                logging.warning(f"Running {label}, it has not run on this unit before")
+                f(self, *args, **kwargs)
+                self.run_once_per_unit_store.add(label)
+
+        return wrapped_f
+
+    return wrap
+
+
 class LocalStorage:
     def __init__(self, storage):
         self.storage = storage
@@ -117,8 +155,8 @@ class OSBaseOperatorCharm(ops.charm.CharmBase):
 
     _state = ops.framework.StoredState()
 
-    DB_SYNC_LABEL = "db-sync"
-    BOOTSTRAPPED_LABELS = [DB_SYNC_LABEL]
+#    DB_SYNC_LABEL = "db-sync"
+#    BOOTSTRAPPED_LABELS = [DB_SYNC_LABEL]
 
     # Holds set of mandatory relations
     mandatory_relations = set()
@@ -216,43 +254,43 @@ class OSBaseOperatorCharm(ops.charm.CharmBase):
         # react to all units being upgraded so rerun `configure_charm`.
         self.configure_charm(event)
 
-    def run_once_per_app(label):
-        """
-        Decorator for hook to specify minimum supported release
-        """
-
-        def wrap(f):
-            @wraps(f)
-            def wrapped_f(self, *args):
-                if label in self.run_once_per_app_store:
-                    logging.warning(f"LY OPA Not running {label}")
-                else:
-                    logging.warning(f"LY OPA Running {label}")
-                    f(self, *args)
-                    self.run_once_per_app_store.add(label)
-
-            return wrapped_f
-
-        return wrap
-
-    def run_once_per_unit(label):
-        """
-        Decorator for hook to specify minimum supported release
-        """
-
-        def wrap(f):
-            @wraps(f)
-            def wrapped_f(self, *args):
-                if label in self.run_once_per_unit_store:
-                    logging.warning(f"LY OPU Not running {label}")
-                else:
-                    logging.warning(f"LY OPU Running {label}")
-                    f(self, *args)
-                    self.run_once_per_unit_store.add(label)
-
-            return wrapped_f
-
-        return wrap
+#    def run_once_per_app(label):
+#        """
+#        Decorator for hook to specify minimum supported release
+#        """
+#
+#        def wrap(f):
+#            @wraps(f)
+#            def wrapped_f(self, *args):
+#                if label in self.run_once_per_app_store:
+#                    logging.warning(f"LY OPA Not running {label}")
+#                else:
+#                    logging.warning(f"LY OPA Running {label}")
+#                    f(self, *args)
+#                    self.run_once_per_app_store.add(label)
+#
+#            return wrapped_f
+#
+#        return wrap
+#
+#    def run_once_per_unit(label):
+#        """
+#        Decorator for hook to specify minimum supported release
+#        """
+#
+#        def wrap(f):
+#            @wraps(f)
+#            def wrapped_f(self, *args):
+#                if label in self.run_once_per_unit_store:
+#                    logging.warning(f"LY OPU Not running {label}")
+#                else:
+#                    logging.warning(f"LY OPU Running {label}")
+#                    f(self, *args)
+#                    self.run_once_per_unit_store.add(label)
+#
+#            return wrapped_f
+#
+#        return wrap
 
     def can_add_handler(
         self,
@@ -603,7 +641,6 @@ class OSBaseOperatorCharm(ops.charm.CharmBase):
                 logger.warning("DB Sync Out: %s", line.strip())
                 logging.debug("Output from database sync: \n%s", out)
 
-    @run_once_per_app(DB_SYNC_LABEL)
     def run_db_sync(self) -> None:
         """Run DB sync to init DB.
 

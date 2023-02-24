@@ -41,6 +41,8 @@ import ops.charm
 import ops.framework
 import ops.model
 import ops.pebble
+import ops.storage
+import tenacity
 from lightkube import (
     Client,
 )
@@ -56,6 +58,7 @@ import ops_sunbeam.compound_status as compound_status
 import ops_sunbeam.config_contexts as sunbeam_config_contexts
 import ops_sunbeam.container_handlers as sunbeam_chandlers
 import ops_sunbeam.core as sunbeam_core
+import ops_sunbeam.guard as sunbeam_guard
 import ops_sunbeam.relation_handlers as sunbeam_rhandlers
 
 logger = logging.getLogger(__name__)
@@ -65,6 +68,9 @@ class OSBaseOperatorCharm(ops.charm.CharmBase):
     """Base charms for OpenStack operators."""
 
     _state = ops.framework.StoredState()
+
+    #    DB_SYNC_LABEL = "db-sync"
+    #    BOOTSTRAPPED_LABELS = [DB_SYNC_LABEL]
 
     # Holds set of mandatory relations
     mandatory_relations = set()
@@ -79,10 +85,14 @@ class OSBaseOperatorCharm(ops.charm.CharmBase):
                     "by ops_sunbeam"
                 )
             )
+        # unit_bootstrapped is stored in the local unit storage which is lost
+        # when the pod is replaced, so this will revert to False on charm
+        # upgrade or upgrade of the payload container.
+        self._state.set_default(unit_bootstrapped=False)
         self.status = compound_status.Status("workload", priority=100)
         self.status_pool = compound_status.StatusPool(self)
         self.status_pool.add(self.status)
-        self._state.set_default(bootstrapped=False)
+        self.relation_handlers = self.get_relation_handlers()
         self.bootstrap_status = compound_status.Status(
             "bootstrap", priority=90
         )
@@ -91,7 +101,6 @@ class OSBaseOperatorCharm(ops.charm.CharmBase):
             self.bootstrap_status.set(
                 MaintenanceStatus("Service not bootstrapped")
             )
-        self.relation_handlers = self.get_relation_handlers()
         self.pebble_handlers = self.get_pebble_handlers()
         self.framework.observe(self.on.config_changed, self._on_config_changed)
 
@@ -240,18 +249,17 @@ class OSBaseOperatorCharm(ops.charm.CharmBase):
             if h.container_name in container_names
         ]
 
-    # flake8: noqa: C901
-    def configure_charm(self, event: ops.framework.EventBase) -> None:
-        """Catchall handler to configure charm services."""
+    def configure_unit(self, event: ops.framework.EventBase) -> None:
+        """Run configuration on this unit."""
         if self.supports_peer_relation and not (
             self.unit.is_leader() or self.is_leader_ready()
         ):
-            logging.debug("Leader not ready")
-            return
+            raise sunbeam_guard.WaitingExceptionError("Leader not ready")
 
         if not self.relation_handlers_ready():
-            logging.debug("Aborting charm relations not ready")
-            return
+            raise sunbeam_guard.WaitingExceptionError(
+                "Not all relations are ready"
+            )
 
         for ph in self.pebble_handlers:
             if ph.pebble_ready:
@@ -262,32 +270,56 @@ class OSBaseOperatorCharm(ops.charm.CharmBase):
                     f"Not running init for {ph.service_name},"
                     " container not ready"
                 )
+                raise sunbeam_guard.MaintenanceExceptionError(
+                    "Payload container not ready"
+                )
 
         for ph in self.pebble_handlers:
             if not ph.service_ready:
                 logging.debug(
                     f"Aborting container {ph.service_name} service not ready"
                 )
-                return
-
-        if not self.bootstrapped():
-            if not self._do_bootstrap():
-                self._state.bootstrapped = False
-                logging.warning(
-                    "Failed to bootstrap the service, event deferred"
+                raise sunbeam_guard.MaintenanceExceptionError(
+                    "Container service not ready"
                 )
-                # Defer the event to re-trigger the bootstrap process
-                event.defer()
-                return
-            if self.unit.is_leader() and self.supports_peer_relation:
-                self.set_leader_ready()
+        self._state.unit_bootstrapped = True
 
+    def configure_app_leader(self, event):
+        """Run global app setup.
+
+        These are tasks that should only be run once per application and only
+        the leader runs them.
+        """
+        self.run_db_sync()
+        self.set_leader_ready()
+
+    def configure_app_non_leader(self, event):
+        """Check the leader has run any bootstrap tasks."""
+        if not self.bootstrapped:
+            raise sunbeam_guard.WaitingExceptionError("Leader not ready")
+
+    def configure_app(self, event):
+        """Check on (and run if leader) app wide tasks."""
+        if self.unit.is_leader():
+            self.configure_app_leader(event)
+        else:
+            self.configure_app_non_leader(event)
+
+    def add_pebble_health_checks(self):
+        """Add health checks for services in payload containers."""
         # Add healthchecks to the plan
         for ph in self.pebble_handlers:
             ph.add_healthchecks()
 
-        self.status.set(ActiveStatus(""))
-        self._state.bootstrapped = True
+    def configure_charm(self, event: ops.framework.EventBase) -> None:
+        """Catchall handler to configure charm services."""
+        with sunbeam_guard.guard(self, "Bootstrapping"):
+            self.configure_unit(event)
+            self.configure_app(event)
+            self.bootstrap_status.set(ActiveStatus())
+            self.add_pebble_health_checks()
+            logger.info("Setting active status")
+            self.status.set(ActiveStatus(""))
 
     @property
     def supports_peer_relation(self) -> bool:
@@ -385,7 +417,7 @@ class OSBaseOperatorCharm(ops.charm.CharmBase):
 
     def bootstrapped(self) -> bool:
         """Determine whether the service has been bootstrapped."""
-        return self._state.bootstrapped
+        return self._state.unit_bootstrapped and self.is_leader_ready()
 
     def leader_set(self, settings: dict = None, **kwargs) -> None:
         """Juju set data in peer data bag."""
@@ -410,6 +442,22 @@ class OSBaseOperatorCharm(ops.charm.CharmBase):
         """Name of Containerto run db sync from."""
         return self.service_name
 
+    @tenacity.retry(
+        stop=tenacity.stop_after_attempt(3),
+        retry=tenacity.retry_if_exception_type(ops.pebble.ChangeError),
+        after=tenacity.after_log(logger, logging.WARNING),
+        wait=tenacity.wait_exponential(multiplier=1, min=10, max=300),
+    )
+    def _retry_db_sync(self, cmd):
+        container = self.unit.get_container(self.db_sync_container_name)
+        logging.debug("Running sync: \n%s", cmd)
+        process = container.exec(cmd, timeout=5 * 60)
+        out, warnings = process.wait_output()
+        if warnings:
+            for line in warnings.splitlines():
+                logger.warning("DB Sync Out: %s", line.strip())
+                logging.debug("Output from database sync: \n%s", out)
+
     def run_db_sync(self) -> None:
         """Run DB sync to init DB.
 
@@ -421,38 +469,17 @@ class OSBaseOperatorCharm(ops.charm.CharmBase):
         try:
             if self.db_sync_cmds:
                 logger.info("Syncing database...")
-                container = self.unit.get_container(
-                    self.db_sync_container_name
-                )
                 for cmd in self.db_sync_cmds:
-                    logging.debug("Running sync: \n%s", cmd)
-                    process = container.exec(cmd, timeout=5 * 60)
-                    out, warnings = process.wait_output()
-                    if warnings:
-                        for line in warnings.splitlines():
-                            logger.warning("DB Sync Out: %s", line.strip())
-                    logging.debug("Output from database sync: \n%s", out)
+                    try:
+                        self._retry_db_sync(cmd)
+                    except tenacity.RetryError:
+                        raise sunbeam_guard.BlockedExceptionError(
+                            "DB sync failed"
+                        )
         except AttributeError:
             logger.warning(
                 "Not DB sync ran. Charm does not specify self.db_sync_cmds"
             )
-
-    def _do_bootstrap(self) -> bool:
-        """Perform bootstrap.
-
-        :return: Return True if bootstrap is success
-        :rtype: bool
-        """
-        try:
-            self.run_db_sync()
-            self.bootstrap_status.set(ActiveStatus())
-            return True
-        except ops.pebble.ExecError as e:
-            logger.exception("Failed to bootstrap")
-            logger.error("Exited with code %d. Stderr:", e.exit_code)
-            for line in e.stderr.splitlines():
-                logger.error("    %s", line)
-            return False
 
 
 class OSBaseOperatorAPICharm(OSBaseOperatorCharm):

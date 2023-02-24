@@ -72,7 +72,13 @@ class OSBaseOperatorCharm(ops.charm.CharmBase):
     def __init__(self, framework: ops.framework.Framework) -> None:
         """Run constructor."""
         super().__init__(framework)
-
+        if isinstance(self.framework._storage, ops.storage.JujuStorage):
+            raise ValueError(
+                (
+                    "use_juju_for_storage=True is deprecated and not supported "
+                    "by ops_sunbeam"
+                )
+            )
         self.status = compound_status.Status("workload", priority=100)
         self.status_pool = compound_status.StatusPool(self)
         self.status_pool.add(self.status)

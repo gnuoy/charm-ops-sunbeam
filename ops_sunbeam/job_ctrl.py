@@ -20,13 +20,17 @@ case these helpers can limit how frequently they are run.
 
 import logging
 import time
+from typing import (
+    TYPE_CHECKING,
+)
 from functools import (
     wraps,
 )
 
 import ops.framework
 
-import ops_sunbeam
+if TYPE_CHECKING:
+    import ops_sunbeam.charm
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +56,7 @@ def run_once_per_unit(label):
     def wrap(f):
         @wraps(f)
         def wrapped_f(
-            charm: ops_sunbeam.charm.OSBaseOperatorCharm, *args, **kwargs
+            charm: "ops_sunbeam.charm.OSBaseOperatorCharm", *args, **kwargs
         ):
             """Run once decorator.
 

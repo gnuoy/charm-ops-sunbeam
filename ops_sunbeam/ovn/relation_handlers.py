@@ -123,6 +123,16 @@ class OVNRelationUtils:
             yield ":".join((proto, str(hostname), str(port)))
 
     @property
+    def public_sb_connection_str(self) -> str:
+        connection_str = None
+        public_address = self.interface.public_address()
+        if public_address:
+            connection_str = list(self.db_connection_strs(
+                [public_address],
+                self.db_sb_port))[0]
+        return connection_str
+
+    @property
     def db_nb_port(self) -> int:
         """Provide port number for OVN Northbound OVSDB.
 
@@ -434,6 +444,10 @@ class OVSDBCMSProvidesHandler(
         """Handle OVSDB CMS change events."""
         self.callback_f(event)
 
+    def set_public_address_data(self, public_address: str) -> None:
+        self.interface.set_app_data({
+            "public-address": str(public_address)})
+
     def _update_address_data(self) -> None:
         """Update hostname and IP address data on all relations."""
         self.interface.set_unit_data(
@@ -509,6 +523,7 @@ class OVSDBCMSRequiresHandler(
                 "hostnames": self.interface.bound_hostnames(),
                 "local_address": self.cluster_local_addr,
                 "addresses": self.interface.bound_addresses(),
+                "public_sb_connection_str": self.public_sb_connection_str,
                 "db_sb_connection_strs": ",".join(self.db_sb_connection_strs),
                 "db_nb_connection_strs": ",".join(self.db_nb_connection_strs),
                 "db_sb_connection_hostname_strs": ",".join(

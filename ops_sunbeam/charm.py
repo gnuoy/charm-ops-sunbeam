@@ -236,6 +236,14 @@ class OSBaseOperatorCharm(ops.charm.CharmBase):
                 "Not all relations are ready"
             )
 
+    def update_relations(self):
+        """Update relation data."""
+        for handler in self.relation_handlers:
+            try:
+                handler.update_relation_data()
+            except NotImplementedError:
+                logging.debug(f"send_requests not implemented for {handler}")
+
     def configure_unit(self, event: ops.framework.EventBase) -> None:
         """Run configuration on this unit."""
         self.check_leader_ready()
@@ -270,10 +278,12 @@ class OSBaseOperatorCharm(ops.charm.CharmBase):
     def configure_charm(self, event: ops.framework.EventBase) -> None:
         """Catchall handler to configure charm services."""
         with sunbeam_guard.guard(self, "Bootstrapping"):
+            self.update_relations()
             self.configure_unit(event)
             self.configure_app(event)
             self.bootstrap_status.set(ActiveStatus())
             self.post_config_setup()
+            self.update_relations()
 
     @property
     def supports_peer_relation(self) -> bool:
